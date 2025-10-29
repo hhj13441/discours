@@ -1,0 +1,657 @@
+// ==UserScript==
+// @name         持续保活增强版
+// @version      0.1.0
+// @description  [持续运行版] 移除浏览限制，持续浏览所有帖子
+// @author       wyyd
+// @match        https://*/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @license      MIT
+// @icon         
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ================== 配置模块 ==================
+    const Config = {
+        behavior: {
+            scroll: {
+                baseInterval: [800, 2000],
+                stepRange: [300, 700],
+                directionChangeProb: 0.02,
+                maxReverseCount: 2,
+                maxReverseDistance: 1000,
+                bottomThreshold: 150,
+                positionTolerance: 25,
+                maxStagnantChecks: 3
+            },
+            mouse: {
+                moveProbability: 0.25,
+                moveRange: {
+                    x: [80, 280],
+                    y: [80, 350]
+                },
+                moveTypes: ['mousemove', 'mouseover', 'mousedown']
+            },
+            like: {
+                minViews: 0, // 改为0，浏览所有帖子
+                excludeKeywords: ['公告', '置顶', '通知']
+            }
+        },
+        ui: {
+            iframe: {
+                width: '320px',
+                height: '480px',
+                top: '70px',
+                left: '5px',
+                position: 'fixed',
+                zIndex: '9999',
+                border: '1px solid #ddd',
+                borderRadius: '5px'
+            },
+            controlPanel: {
+                display: 'block',
+                position: 'fixed',
+                backgroundColor: 'rgba(255,255,255,0.95)',
+                padding: '15px',
+                borderRadius: '8px',
+                boxShadow: '0 3px 12px rgba(0,0,0,0.15)',
+                zIndex: '10000',
+                fontSize: '14px',
+                cursor: 'move',
+                width: '240px',
+                minWidth: '190px',
+                maxWidth: '250px',
+                minHeight: '70px',
+                maxHeight: '100px'
+            }
+        },
+        system: {
+            performance: {
+                iframePoolSize: 3,
+                maxRetryCount: 2,
+                retryDelay: [3000, 5000]
+            },
+            security: {
+                humanDelay: [100, 800]
+            },
+            loop: {
+                interval: [10000, 30000], // 循环间隔
+                maxEmptyRetries: 3, // 最大空重试次数
+                refreshPageAfter: 20 // 每浏览20个帖子刷新页面
+            }
+        }
+    };
+
+    // ================== 状态管理 ==================
+    const State = {
+        currentLoop: 0,
+        processedTopics: new Set(), // 已处理的帖子集合
+        emptyRetries: 0,
+        isRunning: false,
+        currentProcess: null
+    };
+
+    // ================== 日志模块 ==================
+    const Logger = {
+        logLevel: { error: true, info: true, debug: false },
+        log(type, ...args) {
+            console[type]?.apply(console, [`[LinuxDO助手] [${type.toUpperCase()}]`, ...args]);
+        },
+        error(...args) { this.log('error', ...args); },
+        info(...args) { this.log('info', ...args); },
+        debug(...args) { this.log('debug', ...args); }
+    };
+
+    // ================== 控制面板模块 ==================
+    const ControlPanel = {
+        dragState: {
+            isDragging: false,
+            isResizing: false,
+            startX: 0,
+            startY: 0,
+            initialLeft: 0,
+            initialTop: 0,
+            initialWidth: 0,
+            initialHeight: 0
+        },
+
+        init() {
+            this.ensureDOMReady().then(() => {
+                this.createPanel();
+                GM_registerMenuCommand('打开控制面板', () => this.toggleVisibility(true));
+                this.loadPanelState();
+            });
+        },
+
+        createPanel() {
+            if (document.getElementById('linuxdo-helper-panel')) return;
+
+            const panel = document.createElement('div');
+            panel.id = 'linuxdo-helper-panel';
+            Object.assign(panel.style, Config.ui.controlPanel);
+
+            panel.innerHTML = `
+                <div class="panel-header" style="margin-bottom:12px;color:#333;font-weight:500;">
+                    LinuxDO助手控制
+                    <span class="close-btn" style="float:right;cursor:pointer;font-size:0.8em">×</span>
+                </div>
+                <div class="panel-content" style="display:flex;gap:10px;flex-wrap:wrap;">
+                    <button id="toggle-script" style="padding:8px 16px;background:${
+                        GM_getValue('scriptEnabled', true) ? '#e74c3c' : '#2ecc71'
+                    };color:white;border:none;border-radius:4px;">
+                        ${this.getButtonText()}
+                    </button>
+                    <button id="reload-config" style="padding:8px 16px;background:#3498db;color:white;border:none;border-radius:4px;">
+                        重载配置
+                    </button>
+                </div>
+                <div class="resize-handle" style="
+                    position: absolute;
+                    right: 2px;
+                    bottom: 2px;
+                    width: 12px;
+                    height: 12px;
+                    cursor: se-resize;
+                    border-right: 2px solid #666;
+                    border-bottom: 2px solid #666;
+                "></div>
+            `;
+
+            panel.querySelector('.panel-header').addEventListener('mousedown', (e) => this.startDragging(e));
+            panel.querySelector('.resize-handle').addEventListener('mousedown', (e) => this.startResizing(e));
+            panel.querySelector('.close-btn').addEventListener('click', () => this.toggleVisibility(false));
+            panel.querySelector('#toggle-script').addEventListener('click', () => this.toggleStatus());
+            panel.querySelector('#reload-config').addEventListener('click', () => location.reload());
+
+            document.body.appendChild(panel);
+            document.addEventListener('mousemove', (e) => this.handleDragResize(e));
+            document.addEventListener('mouseup', () => this.stopDragResize());
+            Logger.info('控制面板初始化完成');
+        },
+
+        loadPanelState() {
+            const savedState = GM_getValue('panelState', {
+                x: 20, y: 20,
+                width: Config.ui.controlPanel.width,
+                height: 'auto'
+            });
+
+            const panel = document.getElementById('linuxdo-helper-panel');
+            if (panel) {
+                panel.style.left = `${savedState.x}px`;
+                panel.style.top = `${savedState.y}px`;
+                panel.style.width = savedState.width;
+                if (savedState.height !== 'auto') {
+                    panel.style.height = savedState.height;
+                }
+            }
+        },
+
+        savePanelState() {
+            const panel = document.getElementById('linuxdo-helper-panel');
+            if (panel) {
+                GM_setValue('panelState', {
+                    x: parseInt(panel.style.left),
+                    y: parseInt(panel.style.top),
+                    width: panel.style.width,
+                    height: panel.style.height
+                });
+            }
+        },
+
+        startDragging(e) {
+            const panel = this.getPanel();
+            this.dragState = {
+                isDragging: true,
+                startX: e.clientX,
+                startY: e.clientY,
+                initialLeft: parseInt(panel.style.left),
+                initialTop: parseInt(panel.style.top)
+            };
+            panel.style.transition = 'none';
+            panel.style.opacity = '0.8';
+        },
+
+        startResizing(e) {
+            const panel = this.getPanel();
+            this.dragState = {
+                isResizing: true,
+                startX: e.clientX,
+                startY: e.clientY,
+                initialWidth: panel.offsetWidth,
+                initialHeight: panel.offsetHeight
+            };
+            panel.style.transition = 'none';
+        },
+
+        handleDragResize(e) {
+            const panel = this.getPanel();
+            if (!panel) return;
+
+            if (this.dragState.isDragging) {
+                const deltaX = e.clientX - this.dragState.startX;
+                const deltaY = e.clientY - this.dragState.startY;
+
+                const newX = this.dragState.initialLeft + deltaX;
+                const newY = this.dragState.initialTop + deltaY;
+
+                panel.style.left = `${Math.max(0, Math.min(newX, window.innerWidth - panel.offsetWidth))}px`;
+                panel.style.top = `${Math.max(0, Math.min(newY, window.innerHeight - panel.offsetHeight))}px`;
+            }
+            else if (this.dragState.isResizing) {
+                const deltaX = e.clientX - this.dragState.startX;
+                const deltaY = e.clientY - this.dragState.startY;
+
+                const newWidth = Math.min(
+                    Math.max(
+                        this.dragState.initialWidth + deltaX,
+                        parseInt(Config.ui.controlPanel.minWidth)
+                    ),
+                    parseInt(Config.ui.controlPanel.maxWidth)
+                );
+
+                const newHeight = Math.min(
+                    Math.max(
+                        this.dragState.initialHeight + deltaY,
+                        parseInt(Config.ui.controlPanel.minHeight)
+                    ),
+                    parseInt(Config.ui.controlPanel.maxHeight)
+                );
+
+                panel.style.width = `${newWidth}px`;
+                panel.style.height = `${newHeight}px`;
+            }
+        },
+
+        stopDragResize() {
+            const panel = this.getPanel();
+            if (panel) {
+                panel.style.transition = 'all 0.3s ease';
+                panel.style.opacity = '1';
+                this.savePanelState();
+            }
+            this.dragState.isDragging = false;
+            this.dragState.isResizing = false;
+        },
+
+        getPanel() { return document.getElementById('linuxdo-helper-panel'); },
+        getButtonText() {
+            return GM_getValue('scriptEnabled', true) ?
+                (State.isRunning ? '运行中...' : '停止脚本') : '启动脚本';
+        },
+        toggleStatus() {
+            const newStatus = !GM_getValue('scriptEnabled', true);
+            GM_setValue('scriptEnabled', newStatus);
+
+            if (newStatus) {
+                // 重新启动脚本
+                location.reload();
+            } else {
+                // 停止脚本
+                State.isRunning = false;
+                if (State.currentProcess) {
+                    clearTimeout(State.currentProcess);
+                }
+                this.updateButtonText();
+            }
+        },
+        updateButtonText() {
+            const button = document.querySelector('#toggle-script');
+            if (button) {
+                button.textContent = this.getButtonText();
+                button.style.background = GM_getValue('scriptEnabled', true) ?
+                    (State.isRunning ? '#f39c12' : '#e74c3c') : '#2ecc71';
+            }
+        },
+        toggleVisibility(visible) {
+            const panel = this.getPanel();
+            if (panel) panel.style.display = visible ? 'block' : 'none';
+        },
+        ensureDOMReady() {
+            return new Promise(resolve => {
+                document.readyState === 'complete' ? resolve() : window.addEventListener('load', resolve);
+            });
+        }
+    };
+
+    // ================== 核心模块 ==================
+    const Core = {
+        domCache: {
+            iframePool: [],
+            controlPanel: null
+        },
+
+        async initIframePool() {
+            try {
+                while (this.domCache.iframePool.length < Config.system.performance.iframePoolSize) {
+                    const iframe = document.createElement('iframe');
+                    Object.assign(iframe.style, Config.ui.iframe);
+                    iframe.style.visibility = 'hidden';
+                    this.domCache.iframePool.push(iframe);
+                    document.body.appendChild(iframe);
+                    await this.randomDelay();
+                }
+                Logger.info('Iframe池初始化完成');
+            } catch (error) {
+                Logger.error('Iframe池初始化失败:', error);
+            }
+        },
+
+        randomDelay() {
+            return new Promise(resolve => setTimeout(resolve,
+                Utils.random(...Config.system.security.humanDelay)
+            ));
+        },
+
+        getAvailableIframe() {
+            return this.domCache.iframePool.find(iframe =>
+                iframe.style.visibility === 'hidden'
+            );
+        },
+
+        async releaseIframe(iframe) {
+            try {
+                iframe.style.visibility = 'hidden';
+                iframe.contentWindow.location.replace('about:blank');
+                await this.randomDelay();
+            } catch (error) {
+                Logger.error('释放iframe失败:', error);
+            }
+        }
+    };
+
+    // ================== 工具模块 ==================
+    const Utils = {
+        random: (min, max) => Math.floor(Math.random() * (max - min)) + min,
+
+        async retryExecutor(fn) {
+            for (let i = 0; i < Config.system.performance.maxRetryCount; i++) {
+                try {
+                    return await fn();
+                } catch (error) {
+                    if (i === Config.system.performance.maxRetryCount - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve,
+                        Utils.random(...Config.system.performance.retryDelay)
+                    ));
+                }
+            }
+        },
+
+        safeQuery(selector, context = document) {
+            try {
+                return context.querySelector(selector) || null;
+            } catch (error) {
+                return null;
+            }
+        },
+
+        shuffle: arr => arr.sort(() => Math.random() - 0.5),
+
+        // 生成帖子唯一标识
+        generateTopicId(topic) {
+            return btoa(encodeURIComponent(topic.url)).slice(0, 32);
+        }
+    };
+
+    // ================== 行为模拟模块 ==================
+    const Simulator = {
+        async smartScroll(windowTarget) {
+            let params = {
+                interval: Utils.random(...Config.behavior.scroll.baseInterval),
+                step: Utils.random(...Config.behavior.scroll.stepRange),
+                direction: 1
+            };
+
+            let reverseState = { count: 0, distance: 0 };
+
+            return new Promise(resolve => {
+                const intervalId = setInterval(async () => {
+                    try {
+                        if (Math.random() < Config.behavior.scroll.directionChangeProb) {
+                            params.direction *= -1;
+                        }
+
+                        if (params.direction === -1) {
+                            reverseState.count++;
+                            reverseState.distance += params.step;
+
+                            if (reverseState.count > Config.behavior.scroll.maxReverseCount ||
+                                reverseState.distance > Config.behavior.scroll.maxReverseDistance) {
+                                params.direction = 1;
+                                reverseState = { count: 0, distance: 0 };
+                            }
+                        } else {
+                            reverseState = { count: 0, distance: 0 };
+                        }
+
+                        windowTarget.scrollBy({
+                            top: params.step * params.direction,
+                            behavior: 'smooth'
+                        });
+
+                        const currentPos = windowTarget.scrollY;
+                        const { scrollHeight, clientHeight } = windowTarget.document.documentElement;
+                        if (currentPos + clientHeight >= scrollHeight - Config.behavior.scroll.bottomThreshold) {
+                            clearInterval(intervalId);
+                            resolve();
+                        }
+
+                        await Core.randomDelay();
+                    } catch (error) {
+                        clearInterval(intervalId);
+                        resolve();
+                    }
+                }, params.interval);
+            });
+        },
+
+        humanMouseMove(iframe) {
+            if (Math.random() > Config.behavior.mouse.moveProbability) return;
+
+            const makeMove = (x, y) => {
+                Config.behavior.mouse.moveTypes.forEach(type => {
+                    document.dispatchEvent(new MouseEvent(type, {
+                        clientX: x,
+                        clientY: y,
+                        bubbles: true,
+                        view: window
+                    }));
+                });
+            };
+
+            const rect = iframe.getBoundingClientRect();
+            const start = {
+                x: rect.left + Utils.random(...Config.behavior.mouse.moveRange.x),
+                y: rect.top + Utils.random(...Config.behavior.mouse.moveRange.y)
+            };
+
+            [0.3, 0.6, 0.9].forEach(percent => {
+                setTimeout(() => {
+                    makeMove(
+                        start.x + percent * Utils.random(-50, 50),
+                        start.y + percent * Utils.random(-50, 50)
+                    );
+                }, percent * 200);
+            });
+        }
+    };
+
+    // ================== 帖子获取模块 ==================
+    async function fetchTopics() {
+        try {
+            const items = Array.from(document.querySelectorAll('#list-area .title'))
+                .map(topic => {
+                    const row = topic.closest('tr');
+                    if (!row) return null;
+
+                    // 跳过置顶帖子
+                    if (row.querySelector('.pinned')) return null;
+
+                    // 移除浏览次数限制，浏览所有帖子
+                    const views = parseInt(
+                        row.querySelector('.num.views .number')?.title?.replace(/\D/g, '') || '0'
+                    );
+
+                    const topicData = {
+                        title: topic.textContent.trim(),
+                        url: topic.href,
+                        views: views
+                    };
+
+                    // 生成唯一ID用于去重
+                    topicData.id = Utils.generateTopicId(topicData);
+
+                    // 跳过已处理的帖子
+                    if (State.processedTopics.has(topicData.id)) {
+                        return null;
+                    }
+
+                    return topicData;
+                })
+                .filter(Boolean);
+
+            Logger.info(`获取到 ${items.length} 个新帖子`);
+            return items;
+
+        } catch (error) {
+            Logger.error('获取话题失败:', error);
+            return [];
+        }
+    }
+
+    // ================== 帖子处理模块 ==================
+    async function processTopic(topic, iframe) {
+        try {
+            iframe.style.visibility = 'visible';
+            iframe.src = topic.url;
+
+            // 标记为已处理
+            State.processedTopics.add(topic.id);
+
+            await Promise.race([
+                new Promise((resolve, reject) => {
+                    iframe.onload = () => resolve();
+                    iframe.onerror = () => reject(new Error('Iframe加载失败'));
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('加载超时')), 15000))
+            ]);
+
+            // 点赞逻辑
+            if (!Config.behavior.like.excludeKeywords.some(kw => topic.title.includes(kw))) {
+                const likeBtn = Utils.safeQuery('.btn-toggle-reaction-like', iframe.contentDocument);
+                if (likeBtn?.title.includes('点赞')) {
+                    likeBtn.click();
+                    await Core.randomDelay();
+                }
+            }
+
+            await Simulator.smartScroll(iframe.contentWindow);
+            Simulator.humanMouseMove(iframe);
+
+            Logger.info(`已处理帖子: ${topic.title}`);
+
+        } catch (error) {
+            Logger.error(`处理失败 [${topic.title}]:`, error.message);
+        }
+    }
+
+    // ================== 主循环模块 ==================
+    async function mainLoop() {
+        if (!GM_getValue('scriptEnabled', true) || !State.isRunning) {
+            Logger.info('脚本已停止');
+            return;
+        }
+
+        try {
+            State.currentLoop++;
+            Logger.info(`开始第 ${State.currentLoop} 轮浏览`);
+
+            // 每浏览一定数量后刷新页面获取新内容
+            if (State.currentLoop % Config.system.loop.refreshPageAfter === 0) {
+                Logger.info('刷新页面获取新内容');
+                location.reload();
+                return;
+            }
+
+            const topics = await Utils.retryExecutor(fetchTopics);
+
+            if (topics.length === 0) {
+                State.emptyRetries++;
+                Logger.info(`没有找到新帖子，空重试次数: ${State.emptyRetries}`);
+
+                if (State.emptyRetries >= Config.system.loop.maxEmptyRetries) {
+                    Logger.info('达到最大空重试次数，刷新页面');
+                    location.reload();
+                    return;
+                }
+            } else {
+                State.emptyRetries = 0; // 重置空重试计数
+            }
+
+            for (const topic of Utils.shuffle(topics)) {
+                if (!State.isRunning) break;
+
+                const iframe = Core.getAvailableIframe();
+                if (!iframe) {
+                    await Core.randomDelay();
+                    continue;
+                }
+
+                await processTopic(topic, iframe);
+                await Core.releaseIframe(iframe);
+
+                // 处理间隔
+                await new Promise(resolve =>
+                    setTimeout(resolve, Utils.random(2000, 5000))
+                );
+            }
+
+        } catch (error) {
+            Logger.error('主循环错误:', error);
+        }
+
+        // 继续下一轮循环
+        if (State.isRunning) {
+            const delay = Utils.random(...Config.system.loop.interval);
+            Logger.info(`等待 ${delay/1000} 秒后开始下一轮`);
+
+            State.currentProcess = setTimeout(() => {
+                mainLoop();
+            }, delay);
+        }
+    }
+
+    // ================== 初始化入口 ==================
+    async function initialize() {
+        ControlPanel.init();
+
+        if (!GM_getValue('scriptEnabled', true)) {
+            Logger.info('脚本已禁用');
+            return;
+        }
+
+        try {
+            State.isRunning = true;
+            ControlPanel.updateButtonText();
+
+            await Core.initIframePool();
+            Logger.info('开始持续浏览循环...');
+
+            // 启动主循环
+            mainLoop();
+
+        } catch (error) {
+            Logger.error('初始化错误:', error);
+        }
+    }
+
+    // ================== 启动脚本 ==================
+    window.addEventListener('load', () => {
+        if (document.readyState === 'complete') {
+            initialize();
+        }
+    });
+})();
